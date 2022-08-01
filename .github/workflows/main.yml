@@ -1,43 +1,117 @@
 name: Build and Test
 
 on:
-  pull_request:
   push:
     branches:
-      - master
+      - "**"
+    paths-ignore:
+      - '**/*.md'
+
+  release:
+    types: [published]
+
+  schedule:
+    # Daily 5am australian/brisbane time (7pm UTC)
+    - cron: "0 19 * * *"
+
+  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
   build:
     name: Build and Test
     runs-on: ubuntu-latest
+    # conditionally skip build on PR merge of release-please, because the release creation is going to trigger the real build
+    if: ${{ github.ref_name != 'main' || github.event.head_commit.author.username != 'team-integrations-fnm-bot' }}
+    env:
+      OCTOPUS_API_KEY: ${{ secrets.OCTOPUS_API_KEY }}
+      OCTOPUS_HOST: ${{ secrets.OCTOPUS_URL }}
+      OCTOPUS_SPACE: Integrations
+
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v1
+        uses: actions/checkout@v3
         with:
-          dotnet-version: 5.0.x
+          fetch-depth: "0"
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v0.9.13
+        with:
+          versionSpec: "5.x"
+
+      - name: Call GitVersion
+        uses: gittools/actions/gitversion/execute@v0.9.13
+
+      - name: Determine Version
+        id: git-version
+        run: |
+          if [ "${{ github.event_name }}" == "schedule" ]
+          then
+            echo "::set-output name=nuGetVersion::${GITVERSION_MAJORMINORPATCH}-nightly-${{ github.run_number }}"
+            echo "Version: ${GITVERSION_MAJORMINORPATCH}-nightly-${{ github.run_number }}"
+          else
+            echo "::set-output name=nuGetVersion::${GITVERSION_FULLSEMVER}"
+            echo "Version: ${GITVERSION_FULLSEMVER}"
+          fi
+
       - name: Install Octopus CLI
-        uses: OctopusDeploy/install-octopus-cli-action@v1.1.1
+        uses: OctopusDeploy/install-octopus-cli-action@v1
         with:
           version: latest
+
       - name: Set Octo CLI Path
         id: cli-path
         run: echo "::set-output name=install-path::$(which octo)"
+
       - name: Setup JDK8
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v3
         with:
-          java-version: '8'
-          distribution: 'adopt'
+          java-version: "8"
+          distribution: "adopt"
+
       - name: Build, Execute Unit Tests & E2E Tests
-        run: ./gradlew build
+        run: ./gradlew build test -Pversion=${{ steps.git-version.outputs.nugetVersion }}
         env:
           OCTOPUS_LICENSE: ${{ secrets.OCTOPUS_LICENSE }}
           OCTOPUS_SDK_AT_USE_EXISTING_SERVER: false
           OCTOPUS_CLI_PATH: ${{ steps.cli-path.outputs.install-path }}
+
       - name: Execute Integration Tests
-        run: ./gradlew integrationTest
+        run: ./gradlew integrationTest -Pversion=${{ steps.git-version.outputs.nugetVersion }}
         env:
           OCTOPUS_LICENSE: ${{ secrets.OCTOPUS_LICENSE }}
           OCTOPUS_SDK_AT_USE_EXISTING_SERVER: false
+
+      - name: Create Plugin Zip
+        id: create-package
+        run: |
+          ./gradlew publishToMavenLocal -Pversion=${{ steps.git-version.outputs.nugetVersion }}
+          pushd ~/.m2/repository
+          find . -wholename '**/octopusdeploy/${{ steps.git-version.outputs.nugetVersion }}/*' -print | zip -j ${{ github.workspace }}/Octopus.Jenkins.${{ steps.git-version.outputs.nugetVersion }}.zip -@  
+          popd
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: Octopus.Jenkins.${{ steps.git-version.outputs.nugetVersion }}
+          path: "Octopus.Jenkins.${{ steps.git-version.outputs.nugetVersion }}.zip"
+
+      - name: Push a package to Octopus Deploy 🐙
+        uses: OctopusDeploy/push-package-action@v2
+        with:
+          packages: "Octopus.Jenkins.${{ steps.git-version.outputs.nugetVersion }}.zip"
+
+      - name: Fetch Release Notes
+        id: fetch-release-notes
+        if: github.event_name == 'release'
+        run: |
+          echo "::debug::${{github.event_name}}"
+          OUTPUT_FILE="release_notes.txt"
+          jq --raw-output '.release.body' ${{ github.event_path }} | sed 's#\r#  #g' > $OUTPUT_FILE
+          echo "::set-output name=release-note-file::$OUTPUT_FILE"
+
+      - name: Create a release in Octopus Deploy 🐙
+        uses: OctopusDeploy/create-release-action@v2
+        with:
+          project: "Jenkins Plugin"
+          package_version: ${{ steps.git-version.outputs.nugetVersion }}
+          release_notes_file: ${{ steps.fetch-release-notes.outputs.release-note-file }}
